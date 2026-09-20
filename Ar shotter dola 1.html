@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>AR FPS - Pistola 9mm</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; font-family: sans-serif; }
+  html, body { 
+    width:100%; height:100%; overflow:hidden; 
+    background:transparent !important; 
+    position:fixed; top:0; left:0;
+  }
+  canvas { display:block; width:100%; height:100%; position:absolute; top:0; left:0; }
+  
+  .ui { position:fixed; bottom:20px; left:0; right:0; display:flex; justify-content:space-around; padding:0 10px; z-index:100; pointer-events:none; }
+  .btn { 
+    width:70px; height:70px; border-radius:50%; background:rgba(20,20,20,0.7); 
+    border:2px solid #fff; color:#fff; font-size:11px; font-weight:bold;
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    pointer-events:auto; touch-action:manipulation; user-select:none;
+  }
+  .btn:active { background:rgba(60,60,60,0.9); transform:scale(0.95); }
+  .status { position:fixed; top:10px; left:10px; right:10px; color:#fff; z-index:100; font-size:14px; text-shadow:0 0 2px #000; }
+  .start-overlay { position:fixed; inset:0; background:#111; display:flex; flex-direction:column; align-items:center; justify-content:center; color:#fff; z-index:200; padding:20px; }
+  .start-btn { padding:15px 30px; font-size:18px; background:#e94560; color:#fff; border:none; border-radius:10px; margin-top:20px; cursor:pointer; font-weight:bold; }
+  .start-btn:disabled { background:#555; cursor:not-allowed; }
+  .error-box { background:rgba(255,50,50,0.2); border:1px solid #f55; padding:12px; border-radius:8px; margin-top:15px; max-width:320px; display:none; }
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/examples/js/webxr/ARButton.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/examples/js/loaders/GLTFLoader.js"></script>
+</head>
+<body>
+
+<div class="start-overlay" id="startOverlay">
+  <h2>🔫 AR FPS - Realidad Aumentada</h2>
+  <p id="stepText">Paso 1: Permitir cámara</p>
+  <button class="start-btn" id="camBtn">📷 Conceder Cámara</button>
+  <button class="start-btn" id="arBtn" style="display:none;">🎮 Iniciar Juego AR</button>
+  <p style="font-size:13px; color:#aaa; margin-top:15px;">⚠️ Abre este archivo desde un servidor web (no directamente)</p>
+  <div class="error-box" id="errorBox"></div>
+</div>
+
+<div class="status" id="status">Esperando...</div>
+<div class="ui" id="controlsUI" style="display:none;">
+  <button class="btn" id="aimBtn">🎯<br>Apuntar</button>
+  <button class="btn" id="shootBtn">💥<br>Disparar</button>
+  <button class="btn" id="reloadBtn">🔄<br>Recargar</button>
+  <button class="btn" id="inspectBtn">🔍<br>Inspeccionar</button>
+</div>
+
+<script>
+const PISTOLA_URL = "https://github.com/DJEZRA06/pistolas/raw/refs/heads/main/pistola_9mm.glb";
+
+let scene, camera, renderer, gun = null, gunGroup = new THREE.Group(), mixer = null;
+let clock = new THREE.Clock();
+let isInspecting = false, inspectStartTime = 0;
+const INSPECT_DURATION = 4000;
+let isAiming = false, isReloading = false;
+
+const gunBasePos = new THREE.Vector3(0.25, -0.25, -0.5);
+const gunAimPos = new THREE.Vector3(0.05, -0.15, -0.3);
+const gunInspectPos = new THREE.Vector3(0.35, -0.1, -0.4);
+const gunInspectRot = new THREE.Euler(-0.3, 0.8, 0.1);
+
+const startOverlay = document.getElementById('startOverlay');
+const camBtn = document.getElementById('camBtn');
+const arBtn = document.getElementById('arBtn');
+const statusEl = document.getElementById('status');
+const errorBox = document.getElementById('errorBox');
+const controlsUI = document.getElementById('controlsUI');
+
+function showError(msg) {
+  errorBox.textContent = msg;
+  errorBox.style.display = 'block';
+  console.error(msg);
+}
+
+// PASO 1: Permitir cámara
+camBtn.addEventListener('click', async () => {
+  try {
+    statusEl.textContent = "Solicitando permiso...";
+    const stream = await navigator.mediaDevices.getUserMedia({ 
+      video: { facingMode: 'environment', width: { ideal: 1280 } }, audio: false 
+    });
+    stream.getTracks().forEach(t => t.stop());
+    
+    camBtn.style.display = 'none';
+    arBtn.style.display = 'block';
+    statusEl.textContent = "✅ Cámara lista. Toca Iniciar Juego.";
+  } catch (err) {
+    showError("❌ Permiso denegado: " + err.message);
+  }
+});
+
+// PASO 2: Iniciar AR
+arBtn.addEventListener('click', async () => {
+  if (!navigator.xr) {
+    showError("❌ Tu navegador NO soporta WebXR. Usa Chrome o Edge en Android.");
+    return;
+  }
+  
+  const supported = await navigator.xr.isSessionSupported('immersive-ar');
+  if (!supported) {
+    showError("❌ AR no soportado. Verifica que tengas ARCore instalado/actualizado.");
+    return;
+  }
+
+  startOverlay.style.display = 'none';
+  statusEl.textContent = "Iniciando... mueve el teléfono";
+
+  try {
+    // Configuración CRÍTICA para que se vea la cámara
+    scene = new THREE.Scene();
+    scene.background = null; // Fondo transparente = se ve la cámara ✅
+
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 20);
+    camera.position.set(0, 1.6, 0);
+
+    renderer = new THREE.WebGLRenderer({ 
+      antialias: true, alpha: true, transparent: true, // Transparencia activada ✅
+      powerPreference: 'high-performance'
+    });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    // Luces
+    scene.add(new THREE.DirectionalLight(0xffffff, 1.2).position.set(1, 1, 1));
+    scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+
+    // Arma
+    gunGroup.position.copy(gunBasePos);
+    scene.add(gunGroup);
+
+    const loader = new THREE.GLTFLoader();
+    loader.load(PISTOLA_URL, (gltf) => {
+      gun = gltf.scene;
+      gun.scale.set(0.3, 0.3, 0.3);
+      gunGroup.add(gun);
+      if (gltf.animations.length > 0) mixer = new THREE.AnimationMixer(gun);
+      statusEl.textContent = "✅ ¡Listo! Mueve el teléfono";
+      controlsUI.style.display = 'flex';
+    }, undefined, (err) => {
+      statusEl.textContent = "⚠️ Arma cargada parcialmente";
+      console.error(err);
+    });
+
+    // Sesión AR con Local Floor
+    const session = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['local-floor', 'hit-test'],
+      optionalFeatures: ['dom-overlay']
+    });
+    
+    renderer.xr.setSession(session);
+    
+    session.addEventListener('xrplaneadded', () => {
+      statusEl.textContent = "✅ Superficie detectada";
+    });
+
+    renderer.setAnimationLoop(animate);
+
+  } catch (err) {
+    showError("❌ Error sesión AR: " + err.message + "\n\nUsa dirección que empiece por http:// o https://");
+  }
+});
+
+function shoot() {
+  if (!gun || isReloading || isInspecting) return;
+  if (navigator.vibrate) navigator.vibrate(50);
+}
+
+function reload() {
+  if (!gun || isReloading || isInspecting) return;
+  isReloading = true;
+  statusEl.textContent = "Recargando...";
+  let t = 0;
+  const anim = setInterval(() => {
+    t += 0.05;
+    if (t >= 1) {
+      clearInterval(anim);
+      gunGroup.position.copy(isAiming ? gunAimPos : gunBasePos);
+      isReloading = false;
+      statusEl.textContent = "Listo";
+      return;
+    }
+    const phase = t < 0.5 ? t*2 : 2 - t*2;
+    gunGroup.position.lerpVectors(gunBasePos, new THREE.Vector3(0.25, -0.4, -0.5), phase);
+  }, 30);
+}
+
+function startInspect() {
+  if (!gun || isInspecting || isReloading) return;
+  isInspecting = true;
+  inspectStartTime = performance.now();
+  statusEl.textContent = "Inspeccionando...";
+}
+
+function animate() {
+  const delta = clock.getDelta();
+  const elapsed = performance.now() - inspectStartTime;
+
+  if (mixer) mixer.update(delta);
+
+  if (isInspecting) {
+    const t = Math.min(elapsed / INSPECT_DURATION, 1);
+    let progress = t < 0.15 ? t/0.15 : t > 0.85 ? 1-(t-0.85)/0.15 : 1;
+    gunGroup.position.lerpVectors(gunBasePos, gunInspectPos, progress);
+    gunGroup.rotation.set(gunInspectRot.x*progress, gunInspectRot.y*progress, gunInspectRot.z*progress);
+    if (elapsed >= INSPECT_DURATION) {
+      isInspecting = false;
+      statusEl.textContent = "Listo";
+    }
+  } else if (!isReloading) {
+    gunGroup.position.lerp(isAiming ? gunAimPos : gunBasePos, delta * 5);
+  }
+
+  renderer.render(scene, camera);
+}
+
+// Botones
+document.addEventListener('DOMContentLoaded', () => {
+  const aimBtn = document.getElementById('aimBtn');
+  const shootBtn = document.getElementById('shootBtn');
+  const reloadBtn = document.getElementById('reloadBtn');
+  const inspectBtn = document.getElementById('inspectBtn');
+
+  aimBtn.addEventListener('touchstart', e => {e.preventDefault(); isAiming=true;});
+  aimBtn.addEventListener('touchend', () => isAiming=false);
+  aimBtn.addEventListener('mousedown', () => isAiming=true);
+  aimBtn.addEventListener('mouseup', () => isAiming=false);
+  shootBtn.addEventListener('click', shoot);
+  shootBtn.addEventListener('touchstart', e => {e.preventDefault(); shoot();});
+  reloadBtn.addEventListener('click', reload);
+  reloadBtn.addEventListener('touchstart', e => {e.preventDefault(); reload();});
+  inspectBtn.addEventListener('click', startInspect);
+  inspectBtn.addEventListener('touchstart', e => {e.preventDefault(); startInspect();});
+});
+
+window.addEventListener('resize', () => {
+  if (!camera || !renderer) return;
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
